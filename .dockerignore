@@ -1,0 +1,8 @@
+*
+!Dockerfile
+!src/
+!src/*.py
+!zeek/
+!zeek/*.zeek
+**/__pycache__
+**/*.pyc
