@@ -5,8 +5,10 @@ import ipaddress
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping
+from typing import Iterable, Mapping
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from local_addresses import get_local_addresses
 
 DEFAULT_FORMAT = (
     "$remote_addr:$remote_port - [$time_iso8601] $protocol "
@@ -22,7 +24,7 @@ class ConfigError(ValueError):
 @dataclass(frozen=True)
 class Rule:
     protocol: str
-    address: str
+    address: str  # 0.0.0.0 / :: mean local IPv4 / IPv6 addresses, respectively.
     ranges: tuple[tuple[int, int], ...]
 
 
@@ -45,13 +47,16 @@ def parse_rules(env: Mapping[str, str]) -> tuple[Rule, ...]:
         try:
             if "%" in address:
                 raise ValueError("scoped IPv6 addresses are not supported")
-            parsed = ipaddress.ip_address(address)
+            if address.startswith("[") and address.endswith("]"):
+                parsed = ipaddress.IPv6Address(address[1:-1])
+            else:
+                parsed = ipaddress.ip_address(address)
             # Zeek represents IPv4-mapped IPv6 addresses as IPv4.
             if isinstance(parsed, ipaddress.IPv6Address) and parsed.ipv4_mapped:
                 parsed = parsed.ipv4_mapped
             address = str(parsed)
         except ValueError as exc:
-            raise ConfigError(f"{key}: invalid exact IP address: {address}") from exc
+            raise ConfigError(f"{key}: invalid IP address: {address}") from exc
         ranges = grouped.setdefault((protocol, address), [])
         for item in port_spec.split(","):
             match = re.fullmatch(r"\s*([0-9]+)\s*(?:-\s*([0-9]+)\s*)?", item)
@@ -125,15 +130,26 @@ class Config:
         )
 
 
-def zeek_config(config: Config) -> str:
+def zeek_config(config: Config, local_hosts: Iterable[str] | None = None) -> str:
     """No untrusted strings: addresses/protocols/counts are parsed before interpolation."""
     lines = ["# Generated; do not edit.", "redef Monitor::rules = table("]
     for rule in config.rules:
         address = f"[{rule.address}]" if ":" in rule.address else rule.address
         ranges = ", ".join(f"[$first={start}, $last={end}]" for start, end in rule.ranges)
         lines.append(f"    [{address}, {rule.protocol}] = vector({ranges}),")
+    lines.append(");")
+    if any(rule.address in {"0.0.0.0", "::"} for rule in config.rules):
+        # Snapshot only when needed. Discovery errors fail closed; never broaden
+        # to all addresses. The explicit parameter is for reproducible PCAP tests.
+        hosts = get_local_addresses() if local_hosts is None else local_hosts
+        parsed_hosts = {ipaddress.ip_address(host) for host in hosts}
+        parsed_hosts = {host.ipv4_mapped if isinstance(host, ipaddress.IPv6Address)
+                        and host.ipv4_mapped else host for host in parsed_hosts}
+        literals = [f"[{host}]" if host.version == 6 else str(host)
+                    for host in sorted(parsed_hosts, key=lambda h: (h.version, int(h)))
+                    if not host.is_unspecified]
+        lines.append("redef Monitor::local_hosts = {" + ", ".join(literals) + "};")
     lines += [
-        ");",
         f"redef udp_inactivity_timeout = {config.udp_timeout} secs;",
     ]
     return "\n".join(lines) + "\n"

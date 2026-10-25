@@ -8,6 +8,8 @@ export {
         first: count;
         last: count;
     };
+    # 0.0.0.0 and [::] are family-specific LOCAL wildcard keys, not literal hosts.
+    const local_hosts: set[addr] = set() &redef;
     const rules: table[addr, transport_proto] of vector of PortRange = table() &redef;
 }
 
@@ -15,7 +17,7 @@ export {
 redef Log::enable_local_logging = F;
 redef Log::enable_remote_logging = F;
 
-function is_server(host: addr, endpoint: port, proto: transport_proto): bool
+function matches_rule(host: addr, endpoint: port, proto: transport_proto): bool
     {
     if ( [host, proto] !in rules )
         return F;
@@ -24,6 +26,16 @@ function is_server(host: addr, endpoint: port, proto: transport_proto): bool
         if ( n >= bounds$first && n <= bounds$last )
             return T;
     return F;
+    }
+
+function is_server(host: addr, endpoint: port, proto: transport_proto): bool
+    {
+    # Exact and wildcard rules are additive; an exact rule for another port
+    # must not suppress a matching wildcard. Never change the recorded address.
+    local wildcard: addr = is_v4_addr(host) ? 0.0.0.0 : [::];
+    local is_local = host in local_hosts || host in 127.0.0.0/8 || host == [::1];
+    return matches_rule(host, endpoint, proto) ||
+           (is_local && matches_rule(wildcard, endpoint, proto));
     }
 
 type Session: record {

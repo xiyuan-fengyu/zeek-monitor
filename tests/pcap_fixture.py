@@ -55,7 +55,7 @@ def packet(src, dst, sport, dport, proto, payload=b"", seq=0, ack=0, flags=0):
     return frame, len(ip_header) + len(transport)
 
 
-def create(directory):
+def create(directory, extra_cases=()):
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     # expected_server: orig, resp, or None (intentionally excluded).
@@ -79,6 +79,7 @@ def create(directory):
         ("udp", "2001:db8::20", 1234, "2001:db8::11", 51015, "orig"),
         ("tcp", "100.64.0.20", 51016, "100.64.0.99", 443, None),
     ]
+    cases.extend(extra_cases)
     expected = []
     frames = []
     for index, (proto, orig, op, resp, rp, server) in enumerate(cases):

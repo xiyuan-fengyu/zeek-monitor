@@ -8,11 +8,13 @@ import tempfile
 import time
 import unittest
 import uuid
+from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from pcap_fixture import create, LISTEN, FORMAT
 from config import Config, zeek_config
+from formatter import LogFormatter
 
 IMAGE = os.environ.get("ZEEK_TEST_IMAGE")
 ROOT = Path(__file__).resolve().parents[1]
@@ -49,6 +51,51 @@ class DockerTests(unittest.TestCase):
             self.assertEqual(sorted(result.stdout.splitlines()), sorted(expected), result.stderr)
             self.assertIn("ready:", result.stderr)
 
+    def test_local_wildcard_family_isolation_and_additive_exact_rules(self):
+        ipv4_rules = {
+            "LISTEN_0": "tcp 0.0.0.0 443,8000-8100",
+            "LISTEN_1": "udp 0.0.0.0 1234",
+            # Exact rules must neither shadow wildcard ports nor duplicate output.
+            "LISTEN_2": "tcp 100.64.0.20 8000,8443",
+            "LISTEN_3": "udp 100.64.0.20 1234",
+            "LISTEN_4": "tcp 0.0.0.0 443",
+        }
+        ipv6_rules = {"LISTEN_8": "tcp [::] 443", "LISTEN_9": "udp :: 1234"}
+        # A synthetic snapshot for historical PCAP, NOT real interface discovery.
+        local_hosts = {"100.64.0.20", "100.64.0.21", "2001:db8::20", "2001:db8::21"}
+        with tempfile.TemporaryDirectory(prefix="zeek-local-wildcard-") as directory:
+            _, expected = create(directory, extra_cases=[
+                # Same ports on REMOTE LAN endpoints must still log.
+                ("tcp", "2001:db8::11", 443, "2001:db8::20", 443, "resp"),
+                ("udp", "2001:db8::11", 1234, "2001:db8::20", 1234, "resp"),
+                ("udp", "100.64.0.11", 1234, "100.64.0.20", 1234, "resp"),
+                # Both endpoints local with matching ports: exclude.
+                ("udp", "100.64.0.21", 1234, "100.64.0.20", 1234, None),
+                ("tcp", "2001:db8::21", 443, "2001:db8::20", 443, None),
+                ("tcp", "127.0.0.1", 443, "127.0.0.2", 443, None),
+                ("tcp", "127.0.0.2", 443, "100.64.0.20", 443, None),
+                ("tcp", "::1", 443, "2001:db8::20", 443, None),
+                # Both IPs local, but only one port matches: still log.
+                ("tcp", "127.0.0.2", 61270, "127.0.0.1", 443, "resp"),
+            ])
+            ipv4_expected = [line for line in expected if ":" not in line.split("|")[0]]
+            ipv6_expected = [line for line in expected if ":" in line.split("|")[0]]
+            self.assertEqual((len(ipv4_expected), len(ipv6_expected)), (10, 6))
+            for rules, wanted in ((ipv4_rules, ipv4_expected),
+                                  (ipv6_rules, ipv6_expected),
+                                  (ipv4_rules | ipv6_rules, expected)):
+                with self.subTest(rules=rules):
+                    Path(directory, "config.zeek").write_text(zeek_config(Config.from_env(rules), local_hosts))
+                    result = docker("run", "--rm", "--network", "none", "--cap-drop", "ALL",
+                                    "--read-only", "--tmpfs", "/tmp", "-w", "/tmp",
+                                    "-v", f"{directory}:/fixtures:ro", "--entrypoint", "zeek", IMAGE,
+                                    "-b", "-r", "/fixtures/sessions.pcap",
+                                    "/opt/zeek-monitor/zeek/monitor.zeek", "/fixtures/config.zeek")
+                    records = [json.loads(line) for line in result.stdout.splitlines()]
+                    self.assertEqual(records.pop(0), {"kind": "ready"})
+                    formatter = LogFormatter(FORMAT, ZoneInfo("UTC"))
+                    self.assertEqual(sorted(formatter.render(record) for record in records), sorted(wanted), result.stderr)
+
     def test_no_default_logs_and_real_zeek_syntax(self):
         with tempfile.TemporaryDirectory(prefix="zeek-no-logs-") as directory:
             create(directory)
@@ -73,6 +120,12 @@ class DockerTests(unittest.TestCase):
                 self.assertIn(text, result.stderr)
 
     def test_live_shared_network_rotation_shutdown_and_restart_append(self):
+        self._live_shared_network_rotation_shutdown_and_restart_append(wildcard=False)
+
+    def test_live_wildcard_shared_network(self):
+        self._live_shared_network_rotation_shutdown_and_restart_append(wildcard=True)
+
+    def _live_shared_network_rotation_shutdown_and_restart_append(self, wildcard):
         suffix = uuid.uuid4().hex[:10]
         network, target, monitor = (f"zeek-test-{name}-{suffix}" for name in ("net", "server", "monitor"))
         service = r'''
@@ -110,7 +163,8 @@ while True:
             server_ip = json.loads(docker("inspect", target).stdout)[0]["NetworkSettings"]["Networks"][network]["IPAddress"]
             with tempfile.TemporaryDirectory(prefix="zeek-live-") as directory:
                 access = Path(directory, "access.log")
-                settings = {"LISTEN_0": f"tcp {server_ip} 18080", "LISTEN_1": f"udp {server_ip} 18081",
+                rule_ip = "0.0.0.0" if wildcard else server_ip
+                settings = {"LISTEN_0": f"tcp {rule_ip} 18080", "LISTEN_1": f"udp {rule_ip} 18081",
                             "LOG_FORMAT": FORMAT, "LOG_FILE": "/logs/access.log", "UDP_INACTIVITY_TIMEOUT": "2"}
 
                 def start():
@@ -119,11 +173,13 @@ while True:
                            "-v", f"{directory}:/logs", *environment(settings), IMAGE)
                     until(lambda: "ready:" in docker("logs", monitor).stderr)
 
-                def send(udp=False, port=None):
+                def send(udp=False, port=None, source_port=None):
                     port = port or (18081 if udp else 18080)
                     code = f'''import socket
 s = socket.socket(socket.AF_INET, {"socket.SOCK_DGRAM" if udp else "socket.SOCK_STREAM"})
 s.settimeout(5)
+if {source_port!r} is not None:
+    s.bind(("0.0.0.0", {source_port!r}))
 s.connect(({server_ip!r}, {port}))
 s.sendall(b"hello")
 assert s.recv(100) == b"response!"
@@ -142,9 +198,14 @@ s.close()
                 start()
                 send()
                 send(udp=True)
+                # These remote containers share the LAN but are NOT local IPs.
+                # A same-numbered source port must not trigger both-server exclusion.
+                send(source_port=18080)
+                send(udp=True, source_port=18081)
                 send(port=18082)  # same IP, unmonitored port: must not appear
-                until(lambda: len(lines()) == 2, timeout=20)
+                until(lambda: len(lines()) == 4, timeout=20)
                 first = lines()
+                self.assertEqual({line.split("|")[1] for line in first if line.split("|")[1] in {"18080", "18081"}}, {"18080", "18081"})
                 self.assertEqual({line.split("|")[2] for line in first}, {"TCP", "UDP"})
                 udp_fields = next(line.split("|") for line in first if "|UDP|" in line)
                 self.assertEqual(udp_fields[3:5], ["33", "37"])
